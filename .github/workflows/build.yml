@@ -106,13 +106,10 @@ jobs:
               --skip_submodule_sync \
               --allow_running_as_root \
               --compile_no_warning_as_error \
-              --no_kleidiai \
-              --no_sve \
               --cmake_extra_defines \
                 CMAKE_POSITION_INDEPENDENT_CODE=ON \
                 onnxruntime_BUILD_UNIT_TESTS=OFF \
-                onnxruntime_BUILD_SHARED_LIB=OFF \
-                onnxruntime_USE_KLEIDIAI=OFF
+                onnxruntime_BUILD_SHARED_LIB=OFF
             # Nothing in a static, test-less build links against re2, so its
             # target is configured but never compiled. Build it explicitly.
             cmake --build build/Release --target re2 -j
@@ -185,15 +182,26 @@ jobs:
               onnxruntime_BUILD_UNIT_TESTS=OFF `
               onnxruntime_BUILD_SHARED_LIB=OFF
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cmake --build build\Release --config Release --target re2
+
+          $arch = if ($env:RUNNER_ARCH -eq 'ARM64') { 'arm64' } else { 'x64' }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+
+          # Nothing in a static, test-less build links against re2, so it is never
+          # compiled. `cmake --build --target re2` cannot do it here: the Visual
+          # Studio generator looks for re2.vcxproj in the top build folder, and
+          # the project lives under _deps. Run MSBuild on the project itself.
+          $re2 = Get-ChildItem build\Release\_deps -Recurse -Filter re2.vcxproj | Select-Object -First 1
+          if (-not $re2) { throw 're2.vcxproj not found' }
+          $msbuild = & $vswhere -latest -products * -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
+          if (-not $msbuild) { throw 'MSBuild.exe not found' }
+          & $msbuild $re2.FullName /nologo /m /p:Configuration=Release /p:Platform=$arch
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
           $libs = Get-ChildItem build\Release -Recurse -Filter *.lib |
             Where-Object { $_.Directory.Name -eq 'Release' -and $_.Name -notin 'libprotobuf.lib', 'libprotoc.lib' }
           if (-not ($libs.Name -contains 'libprotobuf-lite.lib')) { throw 'libprotobuf-lite.lib was not built' }
+          if (-not ($libs.Name -contains 're2.lib')) { throw 're2.lib was not built' }
 
-          $arch = if ($env:RUNNER_ARCH -eq 'ARM64') { 'arm64' } else { 'x64' }
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $lib = & $vswhere -latest -products * -find "VC\Tools\MSVC\*\bin\Host$arch\$arch\lib.exe" | Select-Object -First 1
           if (-not $lib) { throw 'lib.exe not found' }
 
