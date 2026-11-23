@@ -126,6 +126,9 @@ jobs:
 
       # CMAKE_POLICY_VERSION_MINIMUM: the runner ships CMake 4, which rejects the
       # pre-3.5 minimum version that some bundled dependencies (psimd) declare.
+      # CMAKE_SKIP_INSTALL_RULES: a static build with CoreML fails to generate
+      # because coreml_proto is missing from the install export set. Nothing
+      # here runs `cmake --install`, so the install rules are dropped.
       - name: Build (macOS)
         if: runner.os == 'macOS'
         working-directory: src
@@ -141,6 +144,7 @@ jobs:
             --cmake_extra_defines \
               CMAKE_POSITION_INDEPENDENT_CODE=ON \
               CMAKE_POLICY_VERSION_MINIMUM=3.5 \
+              CMAKE_SKIP_INSTALL_RULES=ON \
               CMAKE_OSX_ARCHITECTURES=arm64 \
               CMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
               onnxruntime_BUILD_UNIT_TESTS=OFF \
@@ -225,9 +229,11 @@ jobs:
       - name: Publish
         run: |
           tag="v$ORT_VERSION"
+          # No --target: the tag lands on the tip of master. GitHub refuses the
+          # workflow token a tag on any commit whose workflow files differ from
+          # that tip, which is the case for every run but the newest.
           if ! gh release view "$tag" > /dev/null 2>&1; then
             gh release create "$tag" \
-              --target "$GITHUB_SHA" \
               --title "ONNX Runtime $ORT_VERSION" \
               --notes "Static libraries built from onnxruntime commit $ORT_COMMIT."
           fi
