@@ -11,6 +11,12 @@ on:
 permissions:
   contents: read
 
+# A newer push replaces the run in progress: both would publish to the same
+# release, and only the newest commit can be tagged by the workflow token.
+concurrency:
+  group: build
+  cancel-in-progress: true
+
 env:
   ORT_VERSION: 1.24.2
   # Commit of the v1.24.2 tag. The official PyPI 1.24.2 wheel reports
