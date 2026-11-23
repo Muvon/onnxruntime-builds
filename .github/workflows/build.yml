@@ -1,0 +1,227 @@
+name: Build
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - .github/workflows/build.yml
+      - musl/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ORT_VERSION: 1.24.2
+  # Commit of the v1.24.2 tag. The official PyPI 1.24.2 wheel reports
+  # git-commit-id=058787ceea, and Software Heritage holds the same commit with
+  # tree e42d56bb417bdecf5e1f4f27a75ce01709acb302.
+  ORT_COMMIT: 058787ceead760166e3c50a0a4cba8a833a6f53f
+  # github.com/microsoft/onnxruntime returns 404 since 2026-11-17. The commit
+  # check after the clone is what makes this third-party mirror safe to use.
+  ORT_SOURCE: https://gitcode.com/gh_mirrors/on/onnxruntime.git
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  source:
+    name: Source archive
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch source
+        run: |
+          git clone --single-branch --branch "v$ORT_VERSION" --depth 1 "$ORT_SOURCE" "onnxruntime-$ORT_VERSION"
+          test "$(git -C "onnxruntime-$ORT_VERSION" rev-parse HEAD)" = "$ORT_COMMIT"
+          git -C "onnxruntime-$ORT_VERSION" submodule update --init --recursive
+
+      - name: Package
+        run: |
+          asset="onnxruntime-$ORT_VERSION-src.tar.gz"
+          tar --exclude=.git -czf "$asset" "onnxruntime-$ORT_VERSION"
+          shasum -a 256 "$asset" > "$asset.sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: src
+          path: onnxruntime-*.tar.gz*
+          if-no-files-found: error
+
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-22.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Fetch source
+        run: |
+          # The build tree nests deeper than the 260 characters Windows allows by default.
+          git config --global core.longpaths true
+          git clone --single-branch --branch "v$ORT_VERSION" --depth 1 "$ORT_SOURCE" src
+          test "$(git -C src rev-parse HEAD)" = "$ORT_COMMIT"
+          git -C src submodule update --init --recursive
+
+      # Alpine 3.22 on purpose: the consumer links this archive with the C++
+      # runtime of its own build image, so both sides must use the same release.
+      - name: Build (musl)
+        if: runner.os == 'Linux'
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work/src alpine:3.22 sh -c '
+            set -eu
+            # No protobuf-dev or abseil-cpp-dev: with the system packages present
+            # the build skips its bundled abseil and drops re2 with it.
+            apk add --no-cache git perl bash musl-dev gcc g++ cmake make linux-headers python3 py3-pip patch
+            # The checkout belongs to the runner user, the container runs as root.
+            git config --global --add safe.directory "*"
+            # musl has no execinfo.h; musl/execinfo.h is a no-op stand-in.
+            export C_INCLUDE_PATH=/work/musl
+            export CPLUS_INCLUDE_PATH=/work/musl
+            ./build.sh \
+              --config Release \
+              --build_dir build \
+              --parallel \
+              --skip_tests \
+              --skip_submodule_sync \
+              --allow_running_as_root \
+              --compile_no_warning_as_error \
+              --no_kleidiai \
+              --no_sve \
+              --cmake_extra_defines \
+                CMAKE_POSITION_INDEPENDENT_CODE=ON \
+                onnxruntime_BUILD_UNIT_TESTS=OFF \
+                onnxruntime_BUILD_SHARED_LIB=OFF \
+                onnxruntime_USE_KLEIDIAI=OFF
+            # Nothing in a static, test-less build links against re2, so its
+            # target is configured but never compiled. Build it explicitly.
+            cmake --build build/Release --target re2 -j
+            # libprotobuf.a and libprotoc.a exist only for the protoc host tool.
+            # They define the same symbols as libprotobuf-lite.a, so leave them out.
+            test -n "$(find build/Release -name libprotobuf-lite.a)"
+            mkdir -p /work/dist
+            {
+              echo "create /work/dist/libonnxruntime.a"
+              find build/Release -name "*.a" ! -name libprotobuf.a ! -name libprotoc.a | sed "s/^/addlib /"
+              echo save
+              echo end
+            } | ar -M
+            nm -g --defined-only /work/dist/libonnxruntime.a | grep -q OrtGetApiBase
+            chmod -R a+rwX /work/dist
+          '
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        working-directory: src
+        run: |
+          ./build.sh \
+            --config Release \
+            --build_dir build \
+            --parallel \
+            --skip_tests \
+            --skip_submodule_sync \
+            --compile_no_warning_as_error \
+            --use_coreml \
+            --cmake_extra_defines \
+              CMAKE_POSITION_INDEPENDENT_CODE=ON \
+              CMAKE_OSX_ARCHITECTURES=arm64 \
+              CMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+              onnxruntime_BUILD_UNIT_TESTS=OFF \
+              onnxruntime_BUILD_SHARED_LIB=OFF
+          cmake --build build/Release --target re2 -j
+          test -n "$(find build/Release -name libprotobuf-lite.a)"
+          mkdir -p ../dist
+          find build/Release -name '*.a' ! -name libprotobuf.a ! -name libprotoc.a > ../libs.txt
+          libtool -static -o ../dist/libonnxruntime.a -filelist ../libs.txt
+          # Through a file: grep -q closing the pipe early would fail the step under pipefail.
+          nm -g ../dist/libonnxruntime.a > ../symbols.txt 2> /dev/null || true
+          grep -q OrtGetApiBase ../symbols.txt
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: src
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\build.bat `
+            --config Release `
+            --build_dir build `
+            --parallel `
+            --skip_tests `
+            --skip_submodule_sync `
+            --compile_no_warning_as_error `
+            --cmake_extra_defines `
+              onnxruntime_BUILD_UNIT_TESTS=OFF `
+              onnxruntime_BUILD_SHARED_LIB=OFF
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build build\Release --config Release --target re2
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+          $libs = Get-ChildItem build\Release -Recurse -Filter *.lib |
+            Where-Object { $_.Directory.Name -eq 'Release' -and $_.Name -notin 'libprotobuf.lib', 'libprotoc.lib' }
+          if (-not ($libs.Name -contains 'libprotobuf-lite.lib')) { throw 'libprotobuf-lite.lib was not built' }
+
+          $arch = if ($env:RUNNER_ARCH -eq 'ARM64') { 'arm64' } else { 'x64' }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $lib = & $vswhere -latest -products * -find "VC\Tools\MSVC\*\bin\Host$arch\$arch\lib.exe" | Select-Object -First 1
+          if (-not $lib) { throw 'lib.exe not found' }
+
+          New-Item -ItemType Directory -Force ..\dist | Out-Null
+          $libs.FullName | ForEach-Object { "`"$_`"" } | Set-Content ..\libs.rsp
+          & $lib /NOLOGO /OUT:..\dist\onnxruntime.lib "@..\libs.rsp"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Package
+        run: |
+          cp src/LICENSE src/ThirdPartyNotices.txt dist/
+          asset="onnxruntime-$ORT_VERSION-${{ matrix.target }}.tar.gz"
+          tar -czf "$asset" -C dist .
+          shasum -a 256 "$asset" > "$asset.sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: onnxruntime-*.tar.gz*
+          if-no-files-found: error
+
+  # Publishes whatever built, so one failing target does not hold back the rest.
+  release:
+    name: Release
+    needs: [source, build]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Publish
+        run: |
+          tag="v$ORT_VERSION"
+          if ! gh release view "$tag" > /dev/null 2>&1; then
+            gh release create "$tag" \
+              --target "$GITHUB_SHA" \
+              --title "ONNX Runtime $ORT_VERSION" \
+              --notes "Static libraries built from onnxruntime commit $ORT_COMMIT."
+          fi
+          gh release upload "$tag" assets/*.tar.gz assets/*.sha256 --clobber
